@@ -1,44 +1,55 @@
-name: Django CI
+stages:          # List of stages for jobs, and their order of execution
+  - build
+  - deploy
 
-on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+variables:
+  # fill those if you have a proxy in your environment
+  http_proxy: ""
+  https_proxy: ""
+  no_proxy: ""
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 4
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+build-job:
+  stage: build
+  image: docker
+  environment: production
+  services:
+  - docker:dind
+  before_script:
+    - echo -n $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - echo "Build..."
+    - >
+      docker build
+      --pull
+      --build-arg http_proxy=$http_proxy
+      --build-arg https_proxy=$https_proxy
+      --build-arg no_proxy=$no_proxy
+      --cache-from $CI_REGISTRY/it.simple/vds-test:latest
+      --label "org.opencontainers.image.title=$CI_PROJECT_TITLE"
+      --label "org.opencontainers.image.url=$CI_PROJECT_URL"
+      --label "org.opencontainers.image.created=$CI_JOB_STARTED_AT"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.version=$CI_COMMIT_REF_NAME"
+      --tag $CI_REGISTRY/it.simple/vds-test:$CI_COMMIT_SHA
+      .
+    - docker push $CI_REGISTRY/it.simple/vds-test:$CI_COMMIT_SHA
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Tests
-        env:
-          DJANGO_SETTINGS_MODULE: myproject.settings
-          SECRET_KEY: ${{ secrets.SECRET_KEY }}
-          DEBUG: "True"
-        run: |
-          python manage.py test
+deploy-job:
+  stage: deploy
+  before_script:
+    - 'command -v ssh-agent >/dev/null || ( apk add --update openssh )' 
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan $VM_IPADDRESS » ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - echo "Deploying application..."
+    - >
+      ssh -t $SSH_USER@$VM_IPADDRESS « EOF
+        echo -n $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+        docker stop mynginx1 && docker rm mynginx1 || true
+        docker run --name mynginx1 -p 80:80 -d $CI_REGISTRY/it.simple/vds-test:$CI_COMMIT_SHA
+      EOF
+    - echo "Application successfully deployed."
